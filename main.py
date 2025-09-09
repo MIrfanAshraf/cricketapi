@@ -147,20 +147,130 @@ def schedule():
 
 @app.route('/live')
 def live_matches():
-    link = f"https://www.cricbuzz.com/cricket-match/live-scores"
+    link = "https://www.cricbuzz.com/cricket-match/live-scores"
     source = requests.get(link).text
     page = BeautifulSoup(source, "lxml")
 
-    page = page.find("div",class_="cb-col cb-col-100 cb-bg-white")
-    matches = page.find_all("div",class_="cb-scr-wll-chvrn cb-lv-scrs-col")
+    # Container that holds all matches
+    page = page.find("div", class_="cb-col cb-col-100 cb-bg-white")
+    matches = page.find_all("a", class_="cb-lv-scrs-well")  # anchor has match link + score
 
     live_matches = []
 
-    for i in range(len(matches)):
-        live_matches.append(matches[i].text.strip())
-    
-    
+    for m in matches:
+        # extract matchId from href
+        href = m.get("href", "")
+        match_id = None
+        if href.startswith("/live-cricket-scores/"):
+            match_id = href.split("/")[2]  # second part is ID
+
+        # get team names
+        teams = m.find_all("div", class_="cb-ovr-flo cb-hmscg-tm-nm")
+
+        if len(teams) == 2:
+            team1 = teams[0].get_text(strip=True)
+            team2 = teams[1].get_text(strip=True)
+            summary = f"{team1} vs {team2}"
+            live_matches.append({
+                "matchId": match_id,
+                "liveMatchSummary": summary
+            })
+
     return jsonify(live_matches)
+
+
+@app.route('/match/<match_id>')
+def match_details(match_id):
+    link = f"https://www.cricbuzz.com/live-cricket-scores/{match_id}"
+    source = requests.get(link, headers={"User-Agent": "Mozilla/5.0"}).text
+    page = BeautifulSoup(source, "lxml")
+
+    result = {}
+
+    # ---- Teams ----
+    batting_team = page.find("h2", class_="cb-font-20 text-bold inline-block")
+    # ---- Match title ----
+    title_tag = page.find("h1", class_="cb-nav-hdr")
+    if title_tag:
+        result["title"] = title_tag.get_text(strip=True)
+    
+
+    # ---- Current score ----
+    if batting_team:
+        result["currentScore"] = batting_team.get_text(strip=True)
+
+    # ---- Current run rate ----
+    crr_tag = page.find("span", string=lambda t: t and "CRR:" in t)
+    if crr_tag and crr_tag.find_next("span"):
+        result["currentRunRate"] = crr_tag.find_next("span").get_text(strip=True)
+
+    # ---- Match status ----
+    status_tag = page.find("div", class_="cb-text-stumps")
+    if status_tag:
+        result["status"] = status_tag.get_text(strip=True)
+
+    # ---- Batters ----
+    batters = []
+    inf_blocks = page.select("div.cb-min-inf")
+    if len(inf_blocks) > 0:
+        batter_rows = inf_blocks[0].select("div.cb-min-itm-rw")[:2]
+        for row in batter_rows:
+            cols = row.find_all("div")
+            if len(cols) >= 6:
+                batters.append({
+                    "name": cols[0].get_text(" ", strip=True),
+                    "runs": cols[1].get_text(strip=True),
+                    "balls": cols[2].get_text(strip=True),
+                    "fours": cols[3].get_text(strip=True),
+                    "sixes": cols[4].get_text(strip=True),
+                    "strikeRate": cols[5].get_text(strip=True)
+                })
+    result["batters"] = batters
+
+    # ---- Bowlers ----
+    bowlers = []
+    if len(inf_blocks) > 1:
+        bowler_rows = inf_blocks[1].select("div.cb-min-itm-rw")[:2]
+        for row in bowler_rows:
+            cols = row.find_all("div")
+            if len(cols) >= 6:
+                bowlers.append({
+                    "name": cols[0].get_text(" ", strip=True),
+                    "overs": cols[1].get_text(strip=True),
+                    "maidens": cols[2].get_text(strip=True),
+                    "runs": cols[3].get_text(strip=True),
+                    "wickets": cols[4].get_text(strip=True),
+                    "economy": cols[5].get_text(strip=True)
+                })
+    result["bowlers"] = bowlers
+
+    # ---- Key Stats ----
+    key_stats = {}
+    key_block = page.select_one("div.cb-col.cb-col-33.cb-key-st-lst")
+    if key_block:
+        for row in key_block.select("div.cb-min-itm-rw"):
+            label = row.find("span", class_="text-bold")
+            value = row.find_all("span")[-1]
+            if label and value:
+                text = label.get_text(strip=True)
+                if text.startswith("Partnership"):
+                    key_stats["partnership"] = value.get_text(strip=True)
+                elif text.startswith("Last Wkt"):
+                    key_stats["lastWicket"] = value.get_text(strip=True)
+                elif text.startswith("Ovs Left"):
+                    key_stats["oversLeft"] = value.get_text(strip=True)
+                elif text.startswith("Last 10 overs"):
+                    key_stats["last10Overs"] = value.get_text(strip=True)
+                elif text.startswith("Toss"):
+                    key_stats["toss"] = value.get_text(strip=True)
+    result["keyStats"] = key_stats
+
+    # ---- Recent balls ----
+    recent_tag = page.find("div", class_="cb-min-rcnt")
+    if recent_tag:
+        result["recent"] = recent_tag.get_text(strip=True).replace("Recent:", "").strip()
+
+    return jsonify(result)
 
 @app.route('/')
 def website():
@@ -168,3 +278,9 @@ def website():
 
 if __name__ =="__main__":
     app.run(debug=True)
+
+
+
+
+
+
