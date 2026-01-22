@@ -1,6 +1,7 @@
 from flask import Flask, jsonify, render_template
 import requests
 from bs4 import BeautifulSoup
+import re
 
 # Try to import googlesearch, but don't crash the whole server if it isn't available
 try:
@@ -25,6 +26,78 @@ def _fetch_html(url: str):
 
 def _page_title(soup: BeautifulSoup) -> str:
     return soup.title.get_text(strip=True) if soup.title else ""
+
+
+def _clean_text(s: str) -> str:
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _split_live_blob_to_matches(text: str):
+    """
+    Takes long combined text from Cricbuzz and tries to split into match entries.
+    Returns list of dicts: {match, status, extra}
+    """
+    t = _clean_text(text)
+
+    # Remove common junk words that appear on Cricbuzz UI
+    junk_words = ["MATCHES", "ALL", "Preview", "PREVIEW"]
+    for jw in junk_words:
+        t = t.replace(jw, " ")
+
+    # Make sure separators are consistent
+    t = _clean_text(t)
+
+    # Many entries look like: "TEAM vs TEAM - status ..."
+    # Split by occurrences of " - " but we will re-attach properly
+    parts = [p.strip() for p in t.split(" - ") if p.strip()]
+
+    results = []
+    current_match = None
+
+    for p in parts:
+        # Detect match-like token "A vs B" or "A v B"
+        # keep it flexible, allow U19, XI, etc.
+        if re.search(r"\b(vs|v)\b", p, re.IGNORECASE):
+            # If p looks like a match title, store it
+            current_match = p
+            continue
+
+        # If we already have a match title, this part is status/details
+        if current_match:
+            status = p
+            # Sometimes next part is extra, we will store later if available
+            results.append({
+                "match": current_match,
+                "status": status
+            })
+            current_match = None
+        else:
+            # If we have a status without match title, store as unknown
+            results.append({
+                "match": "",
+                "status": p
+            })
+
+    # Final cleanup: remove duplicates and super-short garbage
+    cleaned = []
+    seen = set()
+    for item in results:
+        m = _clean_text(item.get("match", ""))
+        s = _clean_text(item.get("status", ""))
+
+        # remove empty/noise lines
+        if len(m) < 3 and len(s) < 10:
+            continue
+
+        key = (m.lower(), s.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+
+        cleaned.append({"match": m, "status": s})
+
+    return cleaned
 
 
 @app.route('/players/<player_name>', methods=['GET'])
@@ -69,29 +142,12 @@ def get_player(player_name):
         if img and img.get("src"):
             image_url = img["src"]
 
-        # Role
-        personal = soup.find_all("div", class_="cb-col cb-col-60 cb-lst-itm-sm")
-        role = personal[2].get_text(" ", strip=True) if len(personal) > 2 else ""
-
-        # Rankings (safe)
-        icc = soup.find_all("div", class_="cb-col cb-col-25 cb-plyr-rank text-right")
-
-        def safe_rank(i):
-            return icc[i].get_text(strip=True) if len(icc) > i else ""
-
-        player_data = {
+        return jsonify({
             "name": name,
             "country": country,
             "image": image_url,
-            "role": role,
-            "rankings": {
-                "batting": {"test": safe_rank(0), "odi": safe_rank(1), "t20": safe_rank(2)},
-                "bowling": {"test": safe_rank(3), "odi": safe_rank(4), "t20": safe_rank(5)},
-            },
-            "profile_url": profile_link,
-        }
-
-        return jsonify(player_data)
+            "profile_url": profile_link
+        })
 
     except Exception as e:
         return jsonify({"error": "Internal error in /players", "details": str(e)}), 500
@@ -99,10 +155,6 @@ def get_player(player_name):
 
 @app.route('/schedule')
 def schedule():
-    """
-    Upcoming international series schedule.
-    Returns either a list OR a clear debug error (never crashes).
-    """
     try:
         url = "https://www.cricbuzz.com/cricket-schedule/upcoming-series/international"
         status, html = _fetch_html(url)
@@ -113,23 +165,19 @@ def schedule():
         soup = BeautifulSoup(html, "html.parser")
         title = _page_title(soup)
 
-        # A bit of structure: schedule text blocks usually live in these areas
         blocks = soup.find_all("div", class_=lambda c: c and ("cb-col-100" in c))
         results = []
 
-        # Extract lines that look like schedules (simple but effective)
         for b in blocks:
-            txt = b.get_text(" ", strip=True)
+            txt = _clean_text(b.get_text(" ", strip=True))
             if not txt:
                 continue
-            # filter obvious junk
-            if "Cricbuzz" in txt and len(txt) < 30:
+            if len(txt) > 240:
                 continue
-            # Keep medium-length lines (schedule entries are often like this)
-            if 25 <= len(txt) <= 220:
-                results.append(txt)
+            if len(txt) < 25:
+                continue
+            results.append(txt)
 
-        # remove duplicates
         uniq = []
         seen = set()
         for x in results:
@@ -137,7 +185,6 @@ def schedule():
                 seen.add(x)
                 uniq.append(x)
 
-        # Keep only first 80 items (safe)
         uniq = uniq[:80]
 
         if not uniq:
@@ -156,8 +203,11 @@ def schedule():
 @app.route('/live')
 def live_matches():
     """
-    Live matches.
-    Cricbuzz changes CSS often, so we extract match cards by multiple strategies.
+    Returns structured JSON:
+    [
+      {"match":"SL vs ENG","status":"SL opt to bat"},
+      {"match":"ZIMU19 vs PAKU19","status":"Need 36 to win"}
+    ]
     """
     try:
         url = "https://www.cricbuzz.com/cricket-match/live-scores"
@@ -169,66 +219,65 @@ def live_matches():
         soup = BeautifulSoup(html, "html.parser")
         title = _page_title(soup)
 
-        # Strategy 1: Try common match-card containers (Cricbuzz changes frequently)
-        # We look for divs that contain "vs" and "Overs" or "won by"/"need" etc.
+        # Grab lots of small text blocks and keep only likely ones
         candidates = soup.find_all(["div", "a"], limit=5000)
 
-        matches = []
+        blobs = []
         for el in candidates:
-            txt = el.get_text(" ", strip=True)
+            txt = _clean_text(el.get_text(" ", strip=True))
             if not txt:
                 continue
-
-            # Very simple pattern checks for cricket score cards
-            has_vs = (" vs " in txt.lower()) or (" v " in txt.lower())
-            has_score_hint = any(k in txt.lower() for k in ["overs", "ov", "run", "target", "won by", "need", "trail", "lead", "innings"])
-            # ignore massive blocks
             if len(txt) > 320:
                 continue
 
-            if has_vs and has_score_hint:
-                matches.append(txt)
+            has_vs = (" vs " in txt.lower()) or (" v " in txt.lower())
+            has_hint = any(k in txt.lower() for k in ["overs", "ov", "won by", "need", "target", "innings", "trail", "lead"])
+            if has_vs and has_hint:
+                blobs.append(txt)
 
-        # Clean duplicates & keep quality
-        cleaned = []
+        # Deduplicate blobs
+        uniq_blobs = []
         seen = set()
-        for m in matches:
-            # skip navigation text
-            if "live scores" in m.lower() and len(m) < 40:
+        for b in blobs:
+            k = b.lower()
+            if k in seen:
                 continue
-            if m not in seen:
-                seen.add(m)
-                cleaned.append(m)
+            seen.add(k)
+            uniq_blobs.append(b)
 
-        # Strategy 2: If still empty, try links that look like match URLs
-        if not cleaned:
-            links = soup.find_all("a", href=True)
-            for a in links:
-                href = a["href"]
-                if "/cricket-match/" in href or "/live-cricket-score/" in href:
-                    txt = a.get_text(" ", strip=True)
-                    if txt and len(txt) < 220:
-                        cleaned.append(txt)
-
-            # de-dup again
-            uniq = []
-            seen2 = set()
-            for x in cleaned:
-                if x not in seen2:
-                    seen2.add(x)
-                    uniq.append(x)
-            cleaned = uniq
-
-        # Final result
-        if not cleaned:
+        if not uniq_blobs:
             return jsonify({
                 "error": "No matches found (Cricbuzz HTML changed).",
                 "status": status,
                 "title": title
             }), 502
 
-        # limit output
-        return jsonify(cleaned[:50])
+        # Take the best (first) blob and split it into match objects
+        # If there are multiple blobs, we merge them
+        all_items = []
+        for blob in uniq_blobs[:8]:
+            all_items.extend(_split_live_blob_to_matches(blob))
+
+        # Final de-dup again
+        final = []
+        seen2 = set()
+        for item in all_items:
+            key = (item["match"].lower(), item["status"].lower())
+            if key in seen2:
+                continue
+            seen2.add(key)
+            final.append(item)
+
+        # If still empty, return debug
+        if not final:
+            return jsonify({
+                "error": "Parsed zero structured matches.",
+                "status": status,
+                "title": title,
+                "sample": uniq_blobs[0][:250]
+            }), 502
+
+        return jsonify(final[:30])
 
     except Exception as e:
         return jsonify({"error": "Internal error in /live", "details": str(e)}), 500
