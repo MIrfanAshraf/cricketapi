@@ -9,6 +9,12 @@ import json
 from googlesearch import search #pip install googlesearch-python
 from flask import render_template
 
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+
 app = Flask(__name__)
 
 
@@ -168,3 +174,4 @@ def website():
 
 if __name__ =="__main__":
     app.run(debug=True)
+
