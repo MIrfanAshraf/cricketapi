@@ -1,4 +1,4 @@
-from flask import Flask, jsonify, Response, render_template
+from flask import Flask, jsonify, render_template
 import requests
 from bs4 import BeautifulSoup
 
@@ -10,7 +10,6 @@ except Exception:
 
 app = Flask(__name__)
 
-# Browser-like headers (reduces chance of Cricbuzz blocking server requests)
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
     "Accept-Language": "en-US,en;q=0.9",
@@ -19,45 +18,49 @@ HEADERS = {
 }
 
 
+def _fetch_html(url: str):
+    r = requests.get(url, headers=HEADERS, timeout=25)
+    return r.status_code, r.text
+
+
+def _page_title(soup: BeautifulSoup) -> str:
+    return soup.title.get_text(strip=True) if soup.title else ""
+
+
 @app.route('/players/<player_name>', methods=['GET'])
 def get_player(player_name):
-    # If googlesearch isn't installed / fails on server, return a clear error instead of crashing
     if search is None:
-        return jsonify({"error": "Player search feature is not available (googlesearch not installed on server)."}), 501
+        return jsonify({"error": "Player search is not available (googlesearch not installed)."}), 501
 
     query = f"{player_name} cricbuzz"
     profile_link = None
 
     try:
-        results = search(query, num_results=5)
+        results = search(query, num_results=8)
         for link in results:
             if "cricbuzz.com/profiles/" in link:
                 profile_link = link
                 break
-
         if not profile_link:
             return jsonify({"error": "No player profile found"}), 404
     except Exception as e:
         return jsonify({"error": f"Search failed: {str(e)}"}), 500
 
     try:
-        r = requests.get(profile_link, headers=HEADERS, timeout=20)
-        if r.status_code != 200:
-            return jsonify({"error": "Failed to fetch Cricbuzz player page", "status": r.status_code}), 502
+        status, html = _fetch_html(profile_link)
+        if status != 200:
+            return jsonify({"error": "Failed to fetch Cricbuzz profile page", "status": status}), 502
 
-        cric = BeautifulSoup(r.text, "html.parser")
+        soup = BeautifulSoup(html, "html.parser")
 
-        profile = cric.find("div", id="playerProfile")
+        profile = soup.find("div", id="playerProfile")
         if not profile:
-            return jsonify({"error": "Cricbuzz layout changed or profile not found"}), 502
+            return jsonify({"error": "Cricbuzz layout changed (playerProfile not found)"}), 502
 
-        pc = profile.find("div", class_="cb-col cb-col-100 cb-bg-white")
-        if not pc:
-            return jsonify({"error": "Cricbuzz layout changed (profile container missing)"}), 502
+        pc = profile.find("div", class_="cb-col cb-col-100 cb-bg-white") or profile
+        name_el = pc.find("h1")
+        country_el = pc.find("h3")
 
-        # Name, country, image
-        name_el = pc.find("h1", class_="cb-font-40")
-        country_el = pc.find("h3", class_="cb-font-18 text-gray")
         name = name_el.get_text(strip=True) if name_el else player_name
         country = country_el.get_text(strip=True) if country_el else ""
 
@@ -67,66 +70,14 @@ def get_player(player_name):
             image_url = img["src"]
 
         # Role
-        personal = cric.find_all("div", class_="cb-col cb-col-60 cb-lst-itm-sm")
+        personal = soup.find_all("div", class_="cb-col cb-col-60 cb-lst-itm-sm")
         role = personal[2].get_text(" ", strip=True) if len(personal) > 2 else ""
 
-        # Rankings
-        icc = cric.find_all("div", class_="cb-col cb-col-25 cb-plyr-rank text-right")
+        # Rankings (safe)
+        icc = soup.find_all("div", class_="cb-col cb-col-25 cb-plyr-rank text-right")
 
         def safe_rank(i):
             return icc[i].get_text(strip=True) if len(icc) > i else ""
-
-        tb = safe_rank(0)
-        ob = safe_rank(1)
-        twb = safe_rank(2)
-        tbw = safe_rank(3)
-        obw = safe_rank(4)
-        twbw = safe_rank(5)
-
-        # Stats tables
-        summary = cric.find_all("div", class_="cb-plyr-tbl")
-        if len(summary) < 2:
-            return jsonify({"error": "Cricbuzz layout changed (stats tables missing)"}), 502
-
-        batting = summary[0]
-        bowling = summary[1]
-
-        # Batting stats
-        batting_stats = {}
-        bat_tbody = batting.find("tbody")
-        if bat_tbody:
-            for row in bat_tbody.find_all("tr"):
-                cols = row.find_all("td")
-                if len(cols) < 13:
-                    continue
-                fmt = cols[0].get_text(strip=True).lower()
-                batting_stats[fmt] = {
-                    "matches": cols[1].get_text(strip=True),
-                    "runs": cols[3].get_text(strip=True),
-                    "highest_score": cols[5].get_text(strip=True),
-                    "average": cols[6].get_text(strip=True),
-                    "strike_rate": cols[7].get_text(strip=True),
-                    "hundreds": cols[12].get_text(strip=True),
-                    "fifties": cols[11].get_text(strip=True),
-                }
-
-        # Bowling stats
-        bowling_stats = {}
-        bowl_tbody = bowling.find("tbody")
-        if bowl_tbody:
-            for row in bowl_tbody.find_all("tr"):
-                cols = row.find_all("td")
-                if len(cols) < 12:
-                    continue
-                fmt = cols[0].get_text(strip=True).lower()
-                bowling_stats[fmt] = {
-                    "balls": cols[3].get_text(strip=True),
-                    "runs": cols[4].get_text(strip=True),
-                    "wickets": cols[5].get_text(strip=True),
-                    "best_bowling_innings": cols[9].get_text(strip=True),
-                    "economy": cols[7].get_text(strip=True),
-                    "five_wickets": cols[11].get_text(strip=True),
-                }
 
         player_data = {
             "name": name,
@@ -134,11 +85,9 @@ def get_player(player_name):
             "image": image_url,
             "role": role,
             "rankings": {
-                "batting": {"test": tb, "odi": ob, "t20": twb},
-                "bowling": {"test": tbw, "odi": obw, "t20": twbw},
+                "batting": {"test": safe_rank(0), "odi": safe_rank(1), "t20": safe_rank(2)},
+                "bowling": {"test": safe_rank(3), "odi": safe_rank(4), "t20": safe_rank(5)},
             },
-            "batting_stats": batting_stats,
-            "bowling_stats": bowling_stats,
             "profile_url": profile_link,
         }
 
@@ -151,48 +100,54 @@ def get_player(player_name):
 @app.route('/schedule')
 def schedule():
     """
-    Fetch upcoming international series schedule from Cricbuzz.
-    This version won't crash; it returns useful debug info if blocked.
+    Upcoming international series schedule.
+    Returns either a list OR a clear debug error (never crashes).
     """
     try:
-        link = "https://www.cricbuzz.com/cricket-schedule/upcoming-series/international"
-        r = requests.get(link, headers=HEADERS, timeout=20)
+        url = "https://www.cricbuzz.com/cricket-schedule/upcoming-series/international"
+        status, html = _fetch_html(url)
 
-        if r.status_code != 200:
-            return jsonify({"error": "Failed to fetch Cricbuzz", "status": r.status_code}), 502
+        if status != 200:
+            return jsonify({"error": "Failed to fetch Cricbuzz", "status": status}), 502
 
-        html = r.text
-        page = BeautifulSoup(html, "html.parser")
-        title = page.title.get_text(strip=True) if page.title else ""
+        soup = BeautifulSoup(html, "html.parser")
+        title = _page_title(soup)
 
-        # If response is too small, it's usually a block / error page
-        if len(html) < 2000:
+        # A bit of structure: schedule text blocks usually live in these areas
+        blocks = soup.find_all("div", class_=lambda c: c and ("cb-col-100" in c))
+        results = []
+
+        # Extract lines that look like schedules (simple but effective)
+        for b in blocks:
+            txt = b.get_text(" ", strip=True)
+            if not txt:
+                continue
+            # filter obvious junk
+            if "Cricbuzz" in txt and len(txt) < 30:
+                continue
+            # Keep medium-length lines (schedule entries are often like this)
+            if 25 <= len(txt) <= 220:
+                results.append(txt)
+
+        # remove duplicates
+        uniq = []
+        seen = set()
+        for x in results:
+            if x not in seen:
+                seen.add(x)
+                uniq.append(x)
+
+        # Keep only first 80 items (safe)
+        uniq = uniq[:80]
+
+        if not uniq:
             return jsonify({
-                "error": "Response too small (likely blocked)",
-                "status": r.status_code,
-                "title": title,
-                "sample": html[:300]
-            }), 502
-
-        match_containers = page.find_all("div", class_="cb-col-100 cb-col")
-        matches = []
-
-        for container in match_containers:
-            date = container.find("div", class_="cb-lv-grn-strip text-bold")
-            match_info = container.find("div", class_="cb-col-100 cb-col")
-            if date and match_info:
-                matches.append(
-                    f"{date.get_text(' ', strip=True)} - {match_info.get_text(' ', strip=True)}"
-                )
-
-        if not matches:
-            return jsonify({
-                "error": "No schedule found (blocked or layout changed)",
-                "status": r.status_code,
+                "error": "No schedule found (layout changed)",
+                "status": status,
                 "title": title
             }), 502
 
-        return jsonify(matches)
+        return jsonify(uniq)
 
     except Exception as e:
         return jsonify({"error": "Internal error in /schedule", "details": str(e)}), 500
@@ -201,60 +156,79 @@ def schedule():
 @app.route('/live')
 def live_matches():
     """
-    Fetch live matches from Cricbuzz.
-    This version is flexible and returns debug info instead of crashing.
+    Live matches.
+    Cricbuzz changes CSS often, so we extract match cards by multiple strategies.
     """
     try:
-        link = "https://www.cricbuzz.com/cricket-match/live-scores"
-        r = requests.get(link, headers=HEADERS, timeout=20)
+        url = "https://www.cricbuzz.com/cricket-match/live-scores"
+        status, html = _fetch_html(url)
 
-        if r.status_code != 200:
-            return jsonify({"error": "Failed to fetch Cricbuzz", "status": r.status_code}), 502
+        if status != 200:
+            return jsonify({"error": "Failed to fetch Cricbuzz", "status": status}), 502
 
-        html = r.text
-        page = BeautifulSoup(html, "html.parser")
-        title = page.title.get_text(strip=True) if page.title else ""
+        soup = BeautifulSoup(html, "html.parser")
+        title = _page_title(soup)
 
-        # If response is too small, it's usually a block / error page
-        if len(html) < 2000:
+        # Strategy 1: Try common match-card containers (Cricbuzz changes frequently)
+        # We look for divs that contain "vs" and "Overs" or "won by"/"need" etc.
+        candidates = soup.find_all(["div", "a"], limit=5000)
+
+        matches = []
+        for el in candidates:
+            txt = el.get_text(" ", strip=True)
+            if not txt:
+                continue
+
+            # Very simple pattern checks for cricket score cards
+            has_vs = (" vs " in txt.lower()) or (" v " in txt.lower())
+            has_score_hint = any(k in txt.lower() for k in ["overs", "ov", "run", "target", "won by", "need", "trail", "lead", "innings"])
+            # ignore massive blocks
+            if len(txt) > 320:
+                continue
+
+            if has_vs and has_score_hint:
+                matches.append(txt)
+
+        # Clean duplicates & keep quality
+        cleaned = []
+        seen = set()
+        for m in matches:
+            # skip navigation text
+            if "live scores" in m.lower() and len(m) < 40:
+                continue
+            if m not in seen:
+                seen.add(m)
+                cleaned.append(m)
+
+        # Strategy 2: If still empty, try links that look like match URLs
+        if not cleaned:
+            links = soup.find_all("a", href=True)
+            for a in links:
+                href = a["href"]
+                if "/cricket-match/" in href or "/live-cricket-score/" in href:
+                    txt = a.get_text(" ", strip=True)
+                    if txt and len(txt) < 220:
+                        cleaned.append(txt)
+
+            # de-dup again
+            uniq = []
+            seen2 = set()
+            for x in cleaned:
+                if x not in seen2:
+                    seen2.add(x)
+                    uniq.append(x)
+            cleaned = uniq
+
+        # Final result
+        if not cleaned:
             return jsonify({
-                "error": "Response too small (likely blocked)",
-                "status": r.status_code,
-                "title": title,
-                "sample": html[:300]
-            }), 502
-
-        # Try multiple containers (Cricbuzz changes often)
-        candidates = []
-
-        root1 = page.find("div", class_="cb-col cb-col-100 cb-bg-white")
-        if root1:
-            candidates.append(root1)
-
-        root2 = page.find("div", id="cb-body")
-        if root2:
-            candidates.append(root2)
-
-        root3 = page.find("body")
-        if root3:
-            candidates.append(root3)
-
-        live_matches_list = []
-        for root in candidates:
-            blocks = root.find_all("div", class_=lambda c: c and "cb-lv-scrs-col" in c)
-            for b in blocks:
-                txt = b.get_text(" ", strip=True)
-                if txt and txt not in live_matches_list:
-                    live_matches_list.append(txt)
-
-        if not live_matches_list:
-            return jsonify({
-                "error": "No matches found (blocked or layout changed)",
-                "status": r.status_code,
+                "error": "No matches found (Cricbuzz HTML changed).",
+                "status": status,
                 "title": title
             }), 502
 
-        return jsonify(live_matches_list)
+        # limit output
+        return jsonify(cleaned[:50])
 
     except Exception as e:
         return jsonify({"error": "Internal error in /live", "details": str(e)}), 500
@@ -266,5 +240,4 @@ def website():
 
 
 if __name__ == "__main__":
-    # Local dev only; Railway uses gunicorn
     app.run(host="0.0.0.0", port=5000, debug=True)
