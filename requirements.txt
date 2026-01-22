@@ -3,4 +3,5 @@ requests
 beautifulsoup4
 gunicorn
 lxml==5.2.2
+googlesearch-python
 
