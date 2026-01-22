@@ -29,73 +29,119 @@ def _page_title(soup: BeautifulSoup) -> str:
 
 
 def _clean_text(s: str) -> str:
-    s = re.sub(r"\s+", " ", s).strip()
+    s = re.sub(r"\s+", " ", (s or "")).strip()
     return s
+
+
+def _extract_score_and_overs(text: str):
+    """
+    Best-effort score extraction from a line.
+    Returns: (score_text, overs_text)
+    Examples:
+      "SL 145/6 (20 ov)" -> ("SL 145/6", "20 ov")
+      "ENG 88-3 (12.4 Ov)" -> ("ENG 88-3", "12.4 ov")
+    """
+    t = _clean_text(text)
+
+    # overs patterns: (12.3 ov), 12 ov, 12.3 Ov
+    overs = ""
+    m_overs = re.search(r"\(?\s*(\d{1,2}(?:\.\d)?)\s*(ov|ovs|over|overs)\s*\)?", t, re.IGNORECASE)
+    if m_overs:
+        overs = f"{m_overs.group(1)} ov"
+
+    # score patterns: 123/4, 123-4, 123 all out
+    # try to capture with team short name around it too
+    score = ""
+    # common: "SL 145/6" or "SL 145-6"
+    m_score = re.search(r"\b([A-Z]{2,6}\s*)?(\d{1,3}\s*(?:/|-)\s*\d{1,2})\b", t)
+    if m_score:
+        team = (m_score.group(1) or "").strip()
+        scr = re.sub(r"\s+", "", m_score.group(2))  # remove spaces in 145 / 6
+        score = f"{team} {scr}".strip()
+
+    # if still empty, try "123 all out"
+    if not score:
+        m_allout = re.search(r"\b([A-Z]{2,6}\s*)?(\d{1,3})\s*(all\s*out)\b", t, re.IGNORECASE)
+        if m_allout:
+            team = (m_allout.group(1) or "").strip()
+            score = f"{team} {m_allout.group(2)} all out".strip()
+
+    return score, overs
 
 
 def _split_live_blob_to_matches(text: str):
     """
-    Takes long combined text from Cricbuzz and tries to split into match entries.
-    Returns list of dicts: {match, status, extra}
+    Takes long combined text from Cricbuzz and splits into match entries.
+    Returns list of dicts: {match, score, overs, status}
     """
     t = _clean_text(text)
 
-    # Remove common junk words that appear on Cricbuzz UI
-    junk_words = ["MATCHES", "ALL", "Preview", "PREVIEW"]
-    for jw in junk_words:
+    # remove common UI junk words
+    for jw in ["MATCHES", "ALL", "Preview", "PREVIEW"]:
         t = t.replace(jw, " ")
 
-    # Make sure separators are consistent
     t = _clean_text(t)
 
-    # Many entries look like: "TEAM vs TEAM - status ..."
-    # Split by occurrences of " - " but we will re-attach properly
+    # split using " - " separators (Cricbuzz uses these a lot)
     parts = [p.strip() for p in t.split(" - ") if p.strip()]
 
     results = []
     current_match = None
 
     for p in parts:
-        # Detect match-like token "A vs B" or "A v B"
-        # keep it flexible, allow U19, XI, etc.
+        # Detect "A vs B" or "A v B"
         if re.search(r"\b(vs|v)\b", p, re.IGNORECASE):
-            # If p looks like a match title, store it
-            current_match = p
+            current_match = _clean_text(p)
             continue
 
-        # If we already have a match title, this part is status/details
         if current_match:
-            status = p
-            # Sometimes next part is extra, we will store later if available
+            # This chunk is usually: score + overs + situation OR just situation
+            chunk = _clean_text(p)
+
+            score, overs = _extract_score_and_overs(chunk)
+
+            # If chunk is only "Innings Break" or "Need 30 to win" etc, keep it as status
+            status = chunk
+
+            # If score exists, try to remove it from status to keep it clean
+            if score:
+                status = status.replace(score, "").strip()
+            if overs:
+                status = re.sub(r"\(?\s*" + re.escape(overs) + r"\s*\)?", "", status, flags=re.IGNORECASE).strip()
+
+            status = _clean_text(status)
+
             results.append({
                 "match": current_match,
+                "score": score,
+                "overs": overs,
                 "status": status
             })
             current_match = None
-        else:
-            # If we have a status without match title, store as unknown
-            results.append({
-                "match": "",
-                "status": p
-            })
 
-    # Final cleanup: remove duplicates and super-short garbage
+    # remove duplicates and tiny noise
     cleaned = []
     seen = set()
     for item in results:
         m = _clean_text(item.get("match", ""))
-        s = _clean_text(item.get("status", ""))
+        sc = _clean_text(item.get("score", ""))
+        ov = _clean_text(item.get("overs", ""))
+        st = _clean_text(item.get("status", ""))
 
-        # remove empty/noise lines
-        if len(m) < 3 and len(s) < 10:
+        if not m:
             continue
 
-        key = (m.lower(), s.lower())
+        key = (m.lower(), sc.lower(), ov.lower(), st.lower())
         if key in seen:
             continue
         seen.add(key)
 
-        cleaned.append({"match": m, "status": s})
+        cleaned.append({
+            "match": m,
+            "score": sc,
+            "overs": ov,
+            "status": st
+        })
 
     return cleaned
 
@@ -125,7 +171,6 @@ def get_player(player_name):
             return jsonify({"error": "Failed to fetch Cricbuzz profile page", "status": status}), 502
 
         soup = BeautifulSoup(html, "html.parser")
-
         profile = soup.find("div", id="playerProfile")
         if not profile:
             return jsonify({"error": "Cricbuzz layout changed (playerProfile not found)"}), 502
@@ -155,10 +200,10 @@ def get_player(player_name):
 
 @app.route('/schedule')
 def schedule():
+    # leaving as-is for now (you said we’ll work later)
     try:
         url = "https://www.cricbuzz.com/cricket-schedule/upcoming-series/international"
         status, html = _fetch_html(url)
-
         if status != 200:
             return jsonify({"error": "Failed to fetch Cricbuzz", "status": status}), 502
 
@@ -167,16 +212,10 @@ def schedule():
 
         blocks = soup.find_all("div", class_=lambda c: c and ("cb-col-100" in c))
         results = []
-
         for b in blocks:
             txt = _clean_text(b.get_text(" ", strip=True))
-            if not txt:
-                continue
-            if len(txt) > 240:
-                continue
-            if len(txt) < 25:
-                continue
-            results.append(txt)
+            if 25 <= len(txt) <= 240:
+                results.append(txt)
 
         uniq = []
         seen = set()
@@ -185,16 +224,10 @@ def schedule():
                 seen.add(x)
                 uniq.append(x)
 
-        uniq = uniq[:80]
-
         if not uniq:
-            return jsonify({
-                "error": "No schedule found (layout changed)",
-                "status": status,
-                "title": title
-            }), 502
+            return jsonify({"error": "No schedule found", "title": title}), 502
 
-        return jsonify(uniq)
+        return jsonify(uniq[:80])
 
     except Exception as e:
         return jsonify({"error": "Internal error in /schedule", "details": str(e)}), 500
@@ -203,10 +236,10 @@ def schedule():
 @app.route('/live')
 def live_matches():
     """
-    Returns structured JSON:
+    Returns:
     [
-      {"match":"SL vs ENG","status":"SL opt to bat"},
-      {"match":"ZIMU19 vs PAKU19","status":"Need 36 to win"}
+      {"match":"SL vs ENG","score":"SL 145/6","overs":"20 ov","status":"Innings Break"},
+      ...
     ]
     """
     try:
@@ -219,23 +252,26 @@ def live_matches():
         soup = BeautifulSoup(html, "html.parser")
         title = _page_title(soup)
 
-        # Grab lots of small text blocks and keep only likely ones
-        candidates = soup.find_all(["div", "a"], limit=5000)
+        # Grab text blocks that likely contain match + score info
+        candidates = soup.find_all(["div", "a"], limit=6000)
 
         blobs = []
         for el in candidates:
             txt = _clean_text(el.get_text(" ", strip=True))
             if not txt:
                 continue
-            if len(txt) > 320:
+
+            # keep medium blocks only
+            if len(txt) > 420:
                 continue
 
+            # require match indicator + some match/score hint
             has_vs = (" vs " in txt.lower()) or (" v " in txt.lower())
-            has_hint = any(k in txt.lower() for k in ["overs", "ov", "won by", "need", "target", "innings", "trail", "lead"])
+            has_hint = any(k in txt.lower() for k in ["overs", "ov", "won by", "need", "target", "innings", "trail", "lead", "/"])
             if has_vs and has_hint:
                 blobs.append(txt)
 
-        # Deduplicate blobs
+        # de-dup blobs
         uniq_blobs = []
         seen = set()
         for b in blobs:
@@ -247,31 +283,29 @@ def live_matches():
 
         if not uniq_blobs:
             return jsonify({
-                "error": "No matches found (Cricbuzz HTML changed).",
+                "error": "No live data found (layout changed)",
                 "status": status,
                 "title": title
             }), 502
 
-        # Take the best (first) blob and split it into match objects
-        # If there are multiple blobs, we merge them
+        # Parse blobs into structured matches
         all_items = []
-        for blob in uniq_blobs[:8]:
+        for blob in uniq_blobs[:10]:
             all_items.extend(_split_live_blob_to_matches(blob))
 
-        # Final de-dup again
+        # final de-dup
         final = []
         seen2 = set()
         for item in all_items:
-            key = (item["match"].lower(), item["status"].lower())
+            key = (item["match"].lower(), item.get("score","").lower(), item.get("overs","").lower(), item.get("status","").lower())
             if key in seen2:
                 continue
             seen2.add(key)
             final.append(item)
 
-        # If still empty, return debug
         if not final:
             return jsonify({
-                "error": "Parsed zero structured matches.",
+                "error": "Parsed zero matches (layout changed)",
                 "status": status,
                 "title": title,
                 "sample": uniq_blobs[0][:250]
